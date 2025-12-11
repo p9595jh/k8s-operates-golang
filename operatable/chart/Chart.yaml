@@ -1,0 +1,6 @@
+version: 1.0.0
+apiVersion: v1
+name: operatable
+description: Operatable written in Go
+sources:
+  - https://github.com/p9595jh/operates

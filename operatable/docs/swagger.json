@@ -1,0 +1,126 @@
+{
+    "swagger": "2.0",
+    "info": {
+        "contact": {}
+    },
+    "paths": {
+        "/api/health": {
+            "get": {
+                "description": "Check the health status of the API",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "Health"
+                ],
+                "summary": "Health Check",
+                "responses": {}
+            }
+        },
+        "/api/jobs/v1": {
+            "get": {
+                "description": "Retrieve the current job",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "Job"
+                ],
+                "summary": "Get job",
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/dto.FindJobResp"
+                        }
+                    }
+                }
+            },
+            "post": {
+                "description": "Create a new job",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "Job"
+                ],
+                "summary": "Create a job",
+                "parameters": [
+                    {
+                        "description": "Job to create",
+                        "name": "job",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/dto.CreateJobDTO"
+                        }
+                    }
+                ],
+                "responses": {
+                    "201": {
+                        "description": "Created",
+                        "schema": {
+                            "$ref": "#/definitions/dto.FindJobResp"
+                        }
+                    }
+                }
+            },
+            "delete": {
+                "description": "Delete the current job",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "Job"
+                ],
+                "summary": "Delete job",
+                "responses": {
+                    "204": {
+                        "description": "No Content"
+                    }
+                }
+            }
+        }
+    },
+    "definitions": {
+        "dto.CreateJobDTO": {
+            "type": "object",
+            "properties": {
+                "duration": {
+                    "description": "in seconds",
+                    "type": "integer"
+                },
+                "name": {
+                    "type": "string"
+                }
+            }
+        },
+        "dto.FindJobResp": {
+            "type": "object",
+            "properties": {
+                "duration": {
+                    "description": "in seconds",
+                    "type": "integer"
+                },
+                "name": {
+                    "type": "string"
+                },
+                "startedAt": {
+                    "type": "string"
+                }
+            }
+        }
+    }
+}

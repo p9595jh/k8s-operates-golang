@@ -1,0 +1,82 @@
+definitions:
+  dto.CreateJobDTO:
+    properties:
+      duration:
+        description: in seconds
+        type: integer
+      name:
+        type: string
+    type: object
+  dto.FindJobResp:
+    properties:
+      duration:
+        description: in seconds
+        type: integer
+      name:
+        type: string
+      startedAt:
+        type: string
+    type: object
+info:
+  contact: {}
+paths:
+  /api/health:
+    get:
+      consumes:
+      - application/json
+      description: Check the health status of the API
+      produces:
+      - application/json
+      responses: {}
+      summary: Health Check
+      tags:
+      - Health
+  /api/jobs/v1:
+    delete:
+      consumes:
+      - application/json
+      description: Delete the current job
+      produces:
+      - application/json
+      responses:
+        "204":
+          description: No Content
+      summary: Delete job
+      tags:
+      - Job
+    get:
+      consumes:
+      - application/json
+      description: Retrieve the current job
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/dto.FindJobResp'
+      summary: Get job
+      tags:
+      - Job
+    post:
+      consumes:
+      - application/json
+      description: Create a new job
+      parameters:
+      - description: Job to create
+        in: body
+        name: job
+        required: true
+        schema:
+          $ref: '#/definitions/dto.CreateJobDTO'
+      produces:
+      - application/json
+      responses:
+        "201":
+          description: Created
+          schema:
+            $ref: '#/definitions/dto.FindJobResp'
+      summary: Create a job
+      tags:
+      - Job
+swagger: "2.0"

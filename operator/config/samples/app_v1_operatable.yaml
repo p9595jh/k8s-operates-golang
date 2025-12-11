@@ -1,0 +1,11 @@
+apiVersion: app.p9595jh.com/v1
+kind: Operatable
+metadata:
+  labels:
+    app.kubernetes.io/name: operator
+    app.kubernetes.io/managed-by: kustomize
+  name: operatable
+spec:
+  # TODO(user): Add fields here
+  maxSize: 5
+  minSize: 0

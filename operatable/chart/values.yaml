@@ -1,0 +1,41 @@
+metadata:
+  namespace: 'app'
+  name: 'operatable'
+
+service:
+  type: ClusterIP
+  http:
+    port: 8070
+    targetPort: 8070
+
+replicas:
+  count: 1
+  revisionHistoryLimit: 2
+
+readinessProbe:
+  path: /api/health
+  initialDelaySeconds: 30
+  periodSeconds: 10
+  timeoutSeconds: 5
+  failureThreshold: 3
+
+livenessProbe:
+  path: /api/health
+  initialDelaySeconds: 30
+  periodSeconds: 10
+  timeoutSeconds: 5
+  failureThreshold: 3
+
+resources:
+  requests:
+    cpu: 128m
+    memory: 128Mi
+  limits:
+    cpu: 256m
+    memory: 512Mi
+
+image:
+  repository: operatable
+  tag: 0.3
+  # pullPolicy: Always
+  pullPolicy: IfNotPresent
