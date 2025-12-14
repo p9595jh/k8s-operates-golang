@@ -30,6 +30,14 @@ func (q *Queue[T]) MustPop() T {
 	return item
 }
 
+func (q *Queue[T]) Get(i int) (T, bool) {
+	if i < 0 || i >= len(q.data) {
+		var zero T
+		return zero, false
+	}
+	return q.data[i], true
+}
+
 func (q *Queue[T]) Len() int {
 	return len(q.data)
 }

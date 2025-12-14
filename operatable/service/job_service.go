@@ -2,11 +2,16 @@ package service
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"operatable/cerror"
+	"operatable/config"
 	"operatable/dto"
 	"operatable/model"
+	"os"
 	"time"
+
+	"github.com/rs/zerolog/log"
 )
 
 type JobService struct {
@@ -35,6 +40,7 @@ func (s *JobService) Create(ctx context.Context, jobDTO *dto.CreateJobDTO) (*dto
 	}
 
 	s.job = &model.Job{
+		ID:        jobDTO.ID,
 		Name:      jobDTO.Name,
 		Duration:  time.Duration(jobDTO.Duration) * time.Second,
 		StartedAt: time.Now(),
@@ -42,11 +48,33 @@ func (s *JobService) Create(ctx context.Context, jobDTO *dto.CreateJobDTO) (*dto
 
 	go func() {
 		time.Sleep(s.job.Duration)
+
+		req, err := http.NewRequest(
+			http.MethodDelete,
+			fmt.Sprintf(
+				"%s/%s/%s",
+				config.Get().System.DoneCallbackURL,
+				os.Getenv("POD_NAME"),
+				s.job.ID,
+			),
+			nil,
+		)
+		if err != nil {
+			log.Error().Err(err).Msg("failed to create done callback request")
+			return
+		}
+
+		client := &http.Client{}
+		_, err = client.Do(req)
+		if err != nil {
+			log.Error().Err(err).Msg("failed to send done callback request")
+			return
+		}
+
 		s.job = nil
 	}()
 
 	return &dto.CreateJobResp{
-		Name:      s.job.Name,
 		StartedAt: s.job.StartedAt.Format(time.RFC3339),
 	}, nil
 }

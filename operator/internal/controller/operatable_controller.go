@@ -17,38 +17,44 @@ limitations under the License.
 package controller
 
 import (
-	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
-	"time"
+	"syscall"
 
-	"github.com/go-logr/logr"
-	"k8s.io/apimachinery/pkg/api/errors"
+	"github.com/oklog/ulid/v2"
+	"github.com/rs/zerolog/log"
+	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/util/retry"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	logf "sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/event"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
+	"sigs.k8s.io/controller-runtime/pkg/predicate"
+	"sigs.k8s.io/controller-runtime/pkg/source"
 
 	operatablev1 "operator/api/v1"
+	"operator/model"
 	"operator/queue"
 	"operator/resourcer"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
-
-var waitDuration = 5 * time.Second
 
 // OperatableReconciler reconciles a Operatable object
 type OperatableReconciler struct {
 	client.Client
-	Scheme    *runtime.Scheme
-	Queue     *queue.Queue[[]byte]
-	Resourcer *resourcer.Resourcer
+	Scheme       *runtime.Scheme
+	Queue        *queue.Queue[*model.JobData]
+	Reservations map[string]*model.JobData // map[PodName]JobID
+	Resourcer    *resourcer.Resourcer
+	EventChannel chan event.GenericEvent
 }
 
 // +kubebuilder:rbac:groups=app.p9595jh.com,resources=operatables,verbs=get;list;watch;create;update;patch;delete
@@ -71,59 +77,74 @@ type OperatableReconciler struct {
 // For more details, check Reconcile and its Result here:
 // - https://pkg.go.dev/sigs.k8s.io/controller-runtime@v0.22.1/pkg/reconcile
 func (r *OperatableReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
-	reqLogger := logf.FromContext(ctx).WithValues("req.Namespace", req.Namespace, "req.Name", req.Name)
-	reqLogger.Info("Reconciling Operatable")
+	log := log.With().Str("rid", ulid.Make().String()).Logger()
+	log.Info().Msg("Reconciling Operatable")
 
 	// Operatable CR 가져오기
 	operatable := &operatablev1.Operatable{}
 	err := r.Get(ctx, req.NamespacedName, operatable)
 	if err != nil {
-		if errors.IsNotFound(err) {
+		if k8serrors.IsNotFound(err) {
 			// 아마도 CR 삭제 케이스
-			reqLogger.Info("Operatable resource not found. Ignoring since object must be deleted")
-			return ctrl.Result{RequeueAfter: waitDuration}, nil
+			log.Info().Msg("Operatable resource not found. Ignoring since object must be deleted")
+			return ctrl.Result{}, nil
 		}
 
-		reqLogger.Error(err, "Failed to get Operatable CR")
-		return ctrl.Result{RequeueAfter: waitDuration}, client.IgnoreNotFound(err)
+		log.Error().Err(err).Msg("Failed to get Operatable CR")
+		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
-
-	// Example logic: Log the desired sizes
-	reqLogger.Info("Operatable sizes", "MinSize", operatable.Spec.MinSize, "MaxSize", operatable.Spec.MaxSize, "Replicas", operatable.Status.Replicas)
 
 	// SSA 수행 및 현재 리소스 가져오기
-	deployment, _, ssaResult, err := r.ssa(ctx, req, reqLogger, operatable)
+	deployment, _, err := r.ssa(ctx, req, operatable)
 	if err != nil {
-		return ssaResult, err
+		return ctrl.Result{}, err
 	}
 
-	if r.Queue.Len() == 0 {
-		reqLogger.Info("No jobs in queue.")
+	log.Info().
+		Int32("MinSize", operatable.Spec.MinSize).
+		Int32("MaxSize", operatable.Spec.MaxSize).
+		Int32("Status.Replicas", deployment.Status.Replicas).
+		Int32("Spec.Replicas", *deployment.Spec.Replicas).
+		Msg("Operatable sizes")
+
+	if r.Queue.Len() == 0 && len(r.Reservations) == 0 {
+		log.Info().Msg("No jobs in queue.")
 
 		podList, err := r.getPodList(ctx, &req)
 		if err != nil {
-			reqLogger.Error(err, "Failed to list pods.", "Operatable.Namespace", operatable.Namespace, "Operatable.Name", operatable.Name)
-			return ctrl.Result{RequeueAfter: waitDuration}, err
+			log.Error().Err(err).Msg("Failed to list pods.")
+			return ctrl.Result{}, err
 		}
 		for _, pod := range podList.Items {
-			reqLogger.Info("Checking the pod working", "pod", pod.Name)
+			log.Info().Str("pod", pod.Name).Msg("Checking the pod working")
+
+			if !isPodReady(&pod) {
+				log.Info().Str("pod", pod.Name).Msg("Pod is not ready, skipping.")
+				continue
+			}
+
+			// 작업 처리 중인지 확인
 			resp, err := http.Get(fmt.Sprintf("http://%s:8070/api/jobs/v1", pod.Status.PodIP))
 			if err != nil {
-				reqLogger.Error(err, "Failed to get jobs", "pod", pod.Name)
-				return ctrl.Result{RequeueAfter: waitDuration}, err
+				log.Error().Err(err).Str("pod", pod.Name).Msg("Empty: Failed to get jobs")
+				if errors.Is(err, syscall.ECONNREFUSED) {
+					// 파드가 재시작 중이거나 곧 종료될 예정일 수 있음
+					continue
+				}
+				return ctrl.Result{}, err
 			}
 
 			body, err := io.ReadAll(resp.Body)
 			if err != nil {
-				reqLogger.Error(err, "Failed to read body", "pod", pod.Name)
-				return ctrl.Result{RequeueAfter: waitDuration}, err
+				log.Error().Err(err).Str("pod", pod.Name).Msg("Failed to read body")
+				return ctrl.Result{}, err
 			}
 			defer resp.Body.Close()
 
-			reqLogger.Info("Got the pod status", "pod", pod.Name, "status", resp.StatusCode, "body", string(body))
+			log.Info().Str("pod", pod.Name).Int("status", resp.StatusCode).RawJSON("body", body).Msg("Got pod status")
 			if resp.StatusCode != http.StatusNotFound {
 				// 아직 처리중인 job이 있음
-				return ctrl.Result{RequeueAfter: waitDuration}, nil
+				return ctrl.Result{}, nil
 			}
 		}
 
@@ -139,88 +160,102 @@ func (r *OperatableReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 			return nil
 		})
 		if err != nil {
-			reqLogger.Error(err, "Failed to scale down Deployment.", "Deployment.Namespace", deployment.Namespace, "Deployment.Name", deployment.Name)
-			return ctrl.Result{RequeueAfter: waitDuration}, err
+			log.Error().Err(err).Msg("Failed to scale down Deployment.")
+			return ctrl.Result{}, err
 		}
-		return ctrl.Result{RequeueAfter: waitDuration}, nil
+		return ctrl.Result{}, nil
 	}
 
-	reqLogger.Info("Jobs in queue.", "Queue.Len", r.Queue.Len())
+	log.Info().Int("Queue.Len", r.Queue.Len()).Int("Reservations", len(r.Reservations)).Msg("Jobs in queue.")
 
 	podList, err := r.getPodList(ctx, &req)
 	if err != nil {
-		reqLogger.Error(err, "Failed to list pods.", "Operatable.Namespace", operatable.Namespace, "Operatable.Name", operatable.Name)
-		return ctrl.Result{RequeueAfter: waitDuration}, err
+		log.Error().Err(err).Msg("Failed to list pods.")
+		return ctrl.Result{}, err
+	}
+
+	if r.Queue.Len() == 0 && len(podList.Items) == 0 {
+		log.Info().Int("Reservations", len(r.Reservations)).Msg("Waiting for the pods started")
+		return ctrl.Result{}, nil
+	} else {
+		log.Info().Int("queue", r.Queue.Len()).Int("pods", len(podList.Items)).Msg("Pods found")
 	}
 
 	for _, pod := range podList.Items {
 
-	POD_CHECKING:
-		for {
-			var conditions []string
-			if pod.Status.Phase == corev1.PodRunning && pod.Status.PodIP != "" {
-				conditions = make([]string, 0, len(pod.Status.Conditions))
-				for _, cond := range pod.Status.Conditions {
-					if cond.Type == corev1.PodReady && cond.Status == corev1.ConditionTrue {
-						break POD_CHECKING
-					}
-					if cond.Type != "" && cond.Status != "" {
-						conditions = append(conditions, fmt.Sprintf("%s=%s", cond.Type, cond.Status))
-					}
-				}
-			}
+		log.Info().Str("pod", pod.Name).Msg("Checking the pod")
 
-			reqLogger.Info(
-				"Get pod property",
-				"pod", pod.Name,
-				"phase", pod.Status.Phase,
-				"podIP", pod.Status.PodIP,
-				"conditions", conditions,
-			)
-			time.Sleep(500 * time.Millisecond)
-			if err := r.reloadPod(ctx, &pod); err != nil {
-				reqLogger.Error(err, "Failed to reload pod", "pod", pod.Name)
+		if isPodStarting(&pod) {
+			if _, reserved := r.Reservations[pod.Name]; !reserved {
+				if r.Queue.Len() == 0 {
+					return ctrl.Result{}, nil
+				}
+
+				job, ok := r.Queue.Pop()
+				if !ok || job == nil {
+					return ctrl.Result{}, nil
+				}
+
+				r.Reservations[pod.Name] = job
+				log.Info().Msgf("Job %s is reserved for pod %s during startup.", job.ID, pod.Name)
 			}
+			return ctrl.Result{}, nil
+		}
+
+		if !isPodReady(&pod) {
+			log.Info().Str("pod", pod.Name).Msg("Pod is not ready, skipping.")
+			continue
 		}
 
 		// 작업 처리 중인지 확인
 		getResp, err := http.Get(fmt.Sprintf("http://%s:8070/api/jobs/v1", pod.Status.PodIP))
 		if err != nil {
-			reqLogger.Error(err, "Failed to get jobs", "pod", pod.Name)
-			return ctrl.Result{RequeueAfter: waitDuration}, err
+			log.Error().Err(err).Str("pod", pod.Name).Msg("Non-Empty: Failed to get jobs")
+			return ctrl.Result{}, err
 		}
 
 		getBody, err := io.ReadAll(getResp.Body)
 		if err != nil {
-			return ctrl.Result{RequeueAfter: waitDuration}, err
+			return ctrl.Result{}, err
 		}
 		defer getResp.Body.Close()
 
-		reqLogger.Info("Got pod status", "pod", pod.Name, "status", getResp.StatusCode, "body", string(getBody))
+		log.Info().Str("pod", pod.Name).Int("status", getResp.StatusCode).RawJSON("body", getBody).Msg("Got pod status")
 		if getResp.StatusCode != http.StatusNotFound {
 			continue
 		}
 
 		// 작업 할당
-		job, _ := r.Queue.Pop()
-		postResp, err := http.Post(fmt.Sprintf("http://%s:8070/api/jobs/v1", pod.Status.PodIP), "application/json", bytes.NewBuffer(job))
+		var job *model.JobData
+		if reservedJob, reserved := r.Reservations[pod.Name]; reserved {
+			// 예약된 작업이 있으면 사용
+			job = reservedJob
+			delete(r.Reservations, pod.Name)
+			log.Info().Msgf("Using reserved job %s for pod %s.", job.ID, pod.Name)
+		} else {
+			if r.Queue.Len() == 0 {
+				break
+			}
+			job, _ = r.Queue.Pop()
+		}
+		postResp, err := http.Post(fmt.Sprintf("http://%s:8070/api/jobs/v1", pod.Status.PodIP), "application/json", job.Data.ToBuffer())
 		if err != nil {
-			reqLogger.Error(err, "Failed to post body", "pod", pod.Name)
+			log.Error().Err(err).Str("pod", pod.Name).Msg("Failed to post job")
 			continue
 		}
 		if postResp.StatusCode != http.StatusCreated {
-			reqLogger.Error(err, "Failed to create job", "pod", pod.Name, "status", postResp.StatusCode)
+			log.Error().Str("pod", pod.Name).Int("status", postResp.StatusCode).Msg("Failed to create job")
 			continue
 		}
 		defer postResp.Body.Close()
 
 		body, err := io.ReadAll(postResp.Body)
 		if err != nil {
-			reqLogger.Error(err, "Failed to parse body", "pod", pod.Name)
+			log.Error().Err(err).Str("pod", pod.Name).Msg("Failed to parse body")
 			continue
 		}
 
-		reqLogger.Info("Job assigned", "pod", pod.Name, "job", string(job), "body", string(body))
+		log.Info().Str("pod", pod.Name).Any("job", job).RawJSON("body", body).Msg("Job assigned")
 	}
 
 	err = retry.RetryOnConflict(retry.DefaultRetry, func() error {
@@ -233,25 +268,65 @@ func (r *OperatableReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		}
 
 		*deployment.Spec.Replicas = min(*deployment.Spec.Replicas+int32(r.Queue.Len()), operatable.Spec.MaxSize)
+		if *deployment.Spec.Replicas == deployment.Status.Replicas {
+			return nil
+		}
+
 		err = r.Client.Update(ctx, deployment)
 		if err != nil {
 			return err
 		}
+		log.Info().Int32("replicas", *deployment.Spec.Replicas).Msg("Scaled up Deployment")
 
 		return nil
 	})
 	if err != nil {
-		reqLogger.Error(err, "Failed to scale up Deployment.", "Deployment.Namespace", deployment.Namespace, "Deployment.Name", deployment.Name)
-		return ctrl.Result{RequeueAfter: waitDuration}, err
+		log.Error().Err(err).Msg("Failed to scale up Deployment.")
+		return ctrl.Result{}, err
 	}
 
-	return ctrl.Result{RequeueAfter: waitDuration}, nil
+	return ctrl.Result{}, nil
 }
 
 // SetupWithManager sets up the controller with the Manager.
 func (r *OperatableReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	r.EventChannel = make(chan event.GenericEvent, 128)
+
+	// 디버깅용 Predicate 정의
+	logEvents := predicate.Funcs{
+		CreateFunc: func(e event.CreateEvent) bool {
+			log.Info().Str("kind", e.Object.GetObjectKind().GroupVersionKind().Kind).Msg("🟢 Create Event detected")
+			return true
+		},
+		DeleteFunc: func(e event.DeleteEvent) bool {
+			log.Info().Msg("🔴 Delete Event detected")
+			return true
+		},
+		UpdateFunc: func(e event.UpdateEvent) bool {
+			// Spec이 바뀌었는지, Status가 바뀌었는지 확인 가능
+			oldGen := e.ObjectOld.GetGeneration()
+			newGen := e.ObjectNew.GetGeneration()
+			if oldGen != newGen {
+				log.Info().Int64("old", oldGen).Int64("new", newGen).Msg("🟡 Spec Update detected")
+			} else {
+				log.Info().Msg("🟡 Status/Meta Update detected")
+			}
+			return true
+		},
+		GenericFunc: func(e event.GenericEvent) bool {
+			// 🔥 채널(EventChannel)을 통해 들어온 건 여기서 잡힘!
+			log.Info().Msg("🟣 Generic/Channel Event detected")
+			return true
+		},
+	}
+
 	return ctrl.NewControllerManagedBy(mgr).
-		For(&operatablev1.Operatable{}).
+		For(&operatablev1.Operatable{}, builder.WithPredicates(logEvents)).
+		Owns(&appsv1.Deployment{}).
+		Owns(&corev1.Pod{}, builder.WithPredicates(podReadyPredicate())).
+		WatchesRawSource(
+			source.Channel(r.EventChannel, &handler.EnqueueRequestForObject{}),
+		).
 		Named("operatable").
 		Complete(r)
 }
@@ -259,9 +334,8 @@ func (r *OperatableReconciler) SetupWithManager(mgr ctrl.Manager) error {
 func (r *OperatableReconciler) ssa(
 	ctx context.Context,
 	req ctrl.Request,
-	reqLogger logr.Logger,
 	operatable *operatablev1.Operatable,
-) (*appsv1.Deployment, *corev1.Service, ctrl.Result, error) {
+) (*appsv1.Deployment, *corev1.Service, error) {
 
 	// ====================================================================
 	// Deployment Apply (Server-Side Apply)
@@ -283,15 +357,13 @@ func (r *OperatableReconciler) ssa(
 
 	// OwnerReference 설정
 	if err := ctrl.SetControllerReference(operatable, dep, r.Scheme); err != nil {
-		reqLogger.Error(err, "Failed to set controller reference on Deployment")
-		return nil, nil, ctrl.Result{RequeueAfter: waitDuration}, err
+		return nil, nil, fmt.Errorf("failed to set controller reference on Deployment: %w", err)
 	}
 
 	// Apply 실행 (없으면 생성, 있으면 수정)
 	// PatchOption 순서 중요: Patch 메서드의 인자로 전달
 	if err := r.Patch(ctx, dep, client.Apply, client.FieldOwner("operatable-controller"), client.ForceOwnership); err != nil {
-		reqLogger.Error(err, "Failed to apply Deployment")
-		return nil, nil, ctrl.Result{RequeueAfter: waitDuration}, err
+		return nil, nil, fmt.Errorf("failed to apply Deployment: %w", err)
 	}
 
 	// ====================================================================
@@ -306,13 +378,11 @@ func (r *OperatableReconciler) ssa(
 	svc.Namespace = req.Namespace
 
 	if err := ctrl.SetControllerReference(operatable, svc, r.Scheme); err != nil {
-		reqLogger.Error(err, "Failed to set controller reference on Service")
-		return nil, nil, ctrl.Result{RequeueAfter: waitDuration}, err
+		return nil, nil, fmt.Errorf("failed to set controller reference on Service: %w", err)
 	}
 
 	if err := r.Patch(ctx, svc, client.Apply, client.FieldOwner("operatable-controller"), client.ForceOwnership); err != nil {
-		reqLogger.Error(err, "Failed to apply Service")
-		return nil, nil, ctrl.Result{RequeueAfter: waitDuration}, err
+		return nil, nil, fmt.Errorf("failed to apply Service: %w", err)
 	}
 
 	// ====================================================================
@@ -321,17 +391,15 @@ func (r *OperatableReconciler) ssa(
 
 	currentDep := &appsv1.Deployment{}
 	if err := r.Get(ctx, req.NamespacedName, currentDep); err != nil {
-		reqLogger.Error(err, "Failed to get current Deployment")
-		return nil, nil, ctrl.Result{RequeueAfter: waitDuration}, err
+		return nil, nil, fmt.Errorf("failed to get current Deployment: %w", err)
 	}
 
 	currentService := &corev1.Service{}
 	if err := r.Get(ctx, req.NamespacedName, currentService); err != nil {
-		reqLogger.Error(err, "Failed to get current Service")
-		return nil, nil, ctrl.Result{RequeueAfter: waitDuration}, err
+		return nil, nil, fmt.Errorf("failed to get current Service: %w", err)
 	}
 
-	return currentDep, currentService, ctrl.Result{}, nil
+	return currentDep, currentService, nil
 }
 
 func (r *OperatableReconciler) getPodList(ctx context.Context, req *ctrl.Request) (*corev1.PodList, error) {
@@ -348,6 +416,40 @@ func (r *OperatableReconciler) getPodList(ctx context.Context, req *ctrl.Request
 	return podList, nil
 }
 
-func (r *OperatableReconciler) reloadPod(ctx context.Context, pod *corev1.Pod) error {
-	return r.Client.Get(ctx, types.NamespacedName{Name: pod.Name, Namespace: pod.Namespace}, pod)
+// func (r *OperatableReconciler) reloadPod(ctx context.Context, pod *corev1.Pod) error {
+// 	return r.Client.Get(ctx, types.NamespacedName{Name: pod.Name, Namespace: pod.Namespace}, pod)
+// }
+
+func (r *OperatableReconciler) NotifyEvent(namespace, name string) {
+	select {
+	case r.EventChannel <- event.GenericEvent{
+		Object: &operatablev1.Operatable{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      name,
+				Namespace: namespace,
+			},
+		},
+	}:
+	default:
+	}
 }
+
+// func (r *OperatableReconciler) HandleJobDone(ctx context.Context, podName string, jobID string) error {
+// 	log.Info().Str("jobID", jobID).Msg("Handling job done callback")
+
+// 	operatable := &operatablev1.Operatable{}
+// 	err := r.Get(ctx, types.NamespacedName{Namespace: "app", Name: "operatable"}, operatable)
+// 	if err != nil {
+// 		log.Error().Err(err).Msg("Failed to get Operatable CR")
+// 		return err
+// 	}
+
+// 	delete(operatable.Status.Runnings[podName], jobID)
+// 	err = r.Status().Update(ctx, operatable)
+// 	if err != nil {
+// 		log.Error().Err(err).Msg("Failed to update Operatable status")
+// 		return err
+// 	}
+
+// 	return nil
+// }

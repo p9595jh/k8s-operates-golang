@@ -18,21 +18,27 @@ package main
 
 import (
 	"crypto/tls"
+	"encoding/json"
 	"flag"
-	"io"
 	"net/http"
 	"os"
+	"time"
 
 	// Import all Kubernetes client auth plugins (e.g. Azure, GCP, OIDC, etc.)
 	// to ensure that exec-entrypoint and run can make use of them.
 
 	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
+	"github.com/rs/zerolog"
+	"github.com/rs/zerolog/log"
 	_ "k8s.io/client-go/plugin/pkg/client/auth"
 
+	"github.com/go-logr/zerologr"
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 	"sigs.k8s.io/controller-runtime/pkg/metrics/filters"
@@ -41,6 +47,7 @@ import (
 
 	appv1 "operator/api/v1"
 	"operator/internal/controller"
+	"operator/model"
 	"operator/queue"
 	"operator/resourcer"
 	// +kubebuilder:scaffold:imports
@@ -91,7 +98,8 @@ func main() {
 	opts.BindFlags(flag.CommandLine)
 	flag.Parse()
 
-	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&opts)))
+	log.Logger = zerolog.New(zerolog.ConsoleWriter{Out: os.Stdout}).With().Timestamp().Logger()
+	ctrl.SetLogger(zerologr.New(&log.Logger))
 
 	// if the enable-http2 flag is false (the default), http/2 should be disabled
 	// due to its vulnerabilities. More specifically, disabling http/2 will
@@ -184,26 +192,72 @@ func main() {
 		os.Exit(1)
 	}
 
-	queue := queue.New[[]byte]()
+	eventChannel := make(chan event.GenericEvent, 256)
+	queue := queue.New[*model.JobData]()
 	resourcer, err := resourcer.New()
 	if err != nil {
 		setupLog.Error(err, "unable to create resourcer")
 		os.Exit(1)
 	}
 
+	operatableController := &controller.OperatableReconciler{
+		Client:       mgr.GetClient(),
+		Scheme:       mgr.GetScheme(),
+		Queue:        queue,
+		Reservations: make(map[string]*model.JobData),
+		Resourcer:    resourcer,
+		EventChannel: eventChannel,
+	}
+
+	if err := operatableController.SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "unable to create controller", "controller", "Operatable")
+		os.Exit(1)
+	}
+	// +kubebuilder:scaffold:builder
+
 	go func() {
 		gin.SetMode(gin.ReleaseMode)
 		router := gin.New()
 
 		router.POST("/api/work", func(c *gin.Context) {
-			body, err := io.ReadAll(c.Request.Body)
-			defer c.Request.Body.Close()
+			var createJobDTO model.CreateJobDTO
+			err := json.NewDecoder(c.Request.Body).Decode(&createJobDTO)
 			if err != nil {
-				c.JSON(http.StatusBadRequest, gin.H{"message": "failed to read body"})
+				c.JSON(http.StatusBadRequest, gin.H{"message": "failed to decode body"})
 				return
 			}
-			queue.Push(body)
+			defer c.Request.Body.Close()
+
+			id := uuid.NewString()
+			createJobDTO.ID = id
+
+			jobData := &model.JobData{
+				ID:        id,
+				CreatedAt: time.Now().Unix(),
+				Data:      &createJobDTO,
+			}
+			log.Info().Any("job", jobData).Msg("Received new job")
+
+			queue.Push(jobData)
+			operatableController.NotifyEvent("app", "operatable")
 			c.JSON(http.StatusOK, gin.H{"message": "job pushed to redis"})
+		})
+
+		router.DELETE("/api/jobs/:pod/:id", func(ctx *gin.Context) {
+			podName := ctx.Param("pod")
+			jobID := ctx.Param("id")
+			log.Info().Str("pod", podName).Str("jobID", jobID).Msg("Received job done callback")
+
+			// go func() {
+			// 	err := operatableController.HandleJobDone(ctx.Request.Context(), podName, jobID)
+			// 	if err != nil {
+			// 		log.Error().Err(err).Str("pod", podName).Str("jobID", jobID).
+			// 			Msg("failed to handle job done callback")
+			// 	}
+			// }()
+
+			operatableController.NotifyEvent("app", "operatable")
+			ctx.JSON(http.StatusOK, gin.H{"message": "job done callback received"})
 		})
 
 		router.GET("/api/health", func(c *gin.Context) {
@@ -217,17 +271,6 @@ func main() {
 			os.Exit(1)
 		}
 	}()
-
-	if err := (&controller.OperatableReconciler{
-		Client:    mgr.GetClient(),
-		Scheme:    mgr.GetScheme(),
-		Queue:     queue,
-		Resourcer: resourcer,
-	}).SetupWithManager(mgr); err != nil {
-		setupLog.Error(err, "unable to create controller", "controller", "Operatable")
-		os.Exit(1)
-	}
-	// +kubebuilder:scaffold:builder
 
 	if err := mgr.AddHealthzCheck("healthz", healthz.Ping); err != nil {
 		setupLog.Error(err, "unable to set up health check")
