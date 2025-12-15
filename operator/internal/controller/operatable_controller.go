@@ -85,11 +85,9 @@ func (r *OperatableReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 	err := r.Get(ctx, req.NamespacedName, operatable)
 	if err != nil {
 		if k8serrors.IsNotFound(err) {
-			// 아마도 CR 삭제 케이스
 			log.Info().Msg("Operatable resource not found. Ignoring since object must be deleted")
 			return ctrl.Result{}, nil
 		}
-
 		log.Error().Err(err).Msg("Failed to get Operatable CR")
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
@@ -97,6 +95,7 @@ func (r *OperatableReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 	// SSA 수행 및 현재 리소스 가져오기
 	deployment, _, err := r.ssa(ctx, req, operatable)
 	if err != nil {
+		log.Error().Err(err).Msg("Failed to apply resources via SSA")
 		return ctrl.Result{}, err
 	}
 
@@ -107,65 +106,6 @@ func (r *OperatableReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		Int32("Spec.Replicas", *deployment.Spec.Replicas).
 		Msg("Operatable sizes")
 
-	if r.Queue.Len() == 0 && len(r.Reservations) == 0 {
-		log.Info().Msg("No jobs in queue.")
-
-		podList, err := r.getPodList(ctx, &req)
-		if err != nil {
-			log.Error().Err(err).Msg("Failed to list pods.")
-			return ctrl.Result{}, err
-		}
-		for _, pod := range podList.Items {
-			log.Info().Str("pod", pod.Name).Msg("Checking the pod working")
-
-			if !isPodReady(&pod) {
-				log.Info().Str("pod", pod.Name).Msg("Pod is not ready, skipping.")
-				continue
-			}
-
-			// 작업 처리 중인지 확인
-			resp, err := http.Get(fmt.Sprintf("http://%s:8070/api/jobs/v1", pod.Status.PodIP))
-			if err != nil {
-				log.Error().Err(err).Str("pod", pod.Name).Msg("Empty: Failed to get jobs")
-				if errors.Is(err, syscall.ECONNREFUSED) {
-					// 파드가 재시작 중이거나 곧 종료될 예정일 수 있음
-					continue
-				}
-				return ctrl.Result{}, err
-			}
-
-			body, err := io.ReadAll(resp.Body)
-			if err != nil {
-				log.Error().Err(err).Str("pod", pod.Name).Msg("Failed to read body")
-				return ctrl.Result{}, err
-			}
-			defer resp.Body.Close()
-
-			log.Info().Str("pod", pod.Name).Int("status", resp.StatusCode).RawJSON("body", body).Msg("Got pod status")
-			if resp.StatusCode != http.StatusNotFound {
-				// 아직 처리중인 job이 있음
-				return ctrl.Result{}, nil
-			}
-		}
-
-		err = retry.RetryOnConflict(retry.DefaultRetry, func() error {
-			if err := r.Get(ctx, req.NamespacedName, deployment); err != nil {
-				return err
-			}
-			deployment.Spec.Replicas = &operatable.Spec.MinSize
-			err = r.Client.Update(ctx, deployment)
-			if err != nil {
-				return err
-			}
-			return nil
-		})
-		if err != nil {
-			log.Error().Err(err).Msg("Failed to scale down Deployment.")
-			return ctrl.Result{}, err
-		}
-		return ctrl.Result{}, nil
-	}
-
 	log.Info().Int("Queue.Len", r.Queue.Len()).Int("Reservations", len(r.Reservations)).Msg("Jobs in queue.")
 
 	podList, err := r.getPodList(ctx, &req)
@@ -174,32 +114,33 @@ func (r *OperatableReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		return ctrl.Result{}, err
 	}
 
-	if r.Queue.Len() == 0 && len(podList.Items) == 0 {
-		log.Info().Int("Reservations", len(r.Reservations)).Msg("Waiting for the pods started")
-		return ctrl.Result{}, nil
-	} else {
-		log.Info().Int("queue", r.Queue.Len()).Int("pods", len(podList.Items)).Msg("Pods found")
-	}
+	// 🔥 [수정] 현재 작업 중인 파드 개수를 세기 위한 변수 추가
+	busyWorkers := 0
 
 	for _, pod := range podList.Items {
-
 		log.Info().Str("pod", pod.Name).Msg("Checking the pod")
 
+		// 1. Starting 상태인 파드 처리 (예약 로직)
 		if isPodStarting(&pod) {
 			if _, reserved := r.Reservations[pod.Name]; !reserved {
+				// 큐에 작업이 없으면 예약 불필요
 				if r.Queue.Len() == 0 {
-					return ctrl.Result{}, nil
+					// 예약은 안 했지만, Starting 중이므로 이 루프는 종료
+					// (단, busyWorkers 카운트는 하지 않음 - Reservations로 계산할 것이므로)
+					continue
 				}
 
 				job, ok := r.Queue.Pop()
 				if !ok || job == nil {
-					return ctrl.Result{}, nil
+					continue
 				}
 
 				r.Reservations[pod.Name] = job
 				log.Info().Msgf("Job %s is reserved for pod %s during startup.", job.ID, pod.Name)
 			}
-			return ctrl.Result{}, nil
+			// 이미 예약되었거나 방금 예약한 경우
+			// 나중에 len(r.Reservations)로 계산할 것이므로 여기선 카운트 X (또는 로직에 따라 포함 가능)
+			continue
 		}
 
 		if !isPodReady(&pod) {
@@ -207,25 +148,34 @@ func (r *OperatableReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 			continue
 		}
 
+		// 2. Running 상태인 파드 작업 확인
 		// 작업 처리 중인지 확인
 		getResp, err := http.Get(fmt.Sprintf("http://%s:8070/api/jobs/v1", pod.Status.PodIP))
 		if err != nil {
-			log.Error().Err(err).Str("pod", pod.Name).Msg("Non-Empty: Failed to get jobs")
-			return ctrl.Result{}, err
-		}
-
-		getBody, err := io.ReadAll(getResp.Body)
-		if err != nil {
-			return ctrl.Result{}, err
+			if errors.Is(err, syscall.ECONNREFUSED) {
+				continue
+			}
+			log.Error().Err(err).Str("pod", pod.Name).Msg("Failed to get jobs")
+			// 통신 에러가 나면 일단 busy로 간주하지 않음 (안전하게)
+			continue
 		}
 		defer getResp.Body.Close()
 
+		getBody, err := io.ReadAll(getResp.Body)
+		if err != nil {
+			log.Error().Err(err).Str("pod", pod.Name).Msg("Failed to read job response body")
+			return ctrl.Result{}, err
+		}
+
 		log.Info().Str("pod", pod.Name).Int("status", getResp.StatusCode).RawJSON("body", getBody).Msg("Got pod status")
+
+		// 🔥 [수정] 작업 중이라면 카운트 증가
 		if getResp.StatusCode != http.StatusNotFound {
+			busyWorkers++ // 이 파드는 바쁩니다.
 			continue
 		}
 
-		// 작업 할당
+		// 3. 노는(Idle) 파드에게 작업 할당
 		var job *model.JobData
 		if reservedJob, reserved := r.Reservations[pod.Name]; reserved {
 			// 예약된 작업이 있으면 사용
@@ -234,54 +184,66 @@ func (r *OperatableReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 			log.Info().Msgf("Using reserved job %s for pod %s.", job.ID, pod.Name)
 		} else {
 			if r.Queue.Len() == 0 {
-				break
+				continue // 더 줄 작업이 없음
 			}
 			job, _ = r.Queue.Pop()
 		}
+
+		// 작업 전송
 		postResp, err := http.Post(fmt.Sprintf("http://%s:8070/api/jobs/v1", pod.Status.PodIP), "application/json", job.Data.ToBuffer())
 		if err != nil {
 			log.Error().Err(err).Str("pod", pod.Name).Msg("Failed to post job")
-			continue
-		}
-		if postResp.StatusCode != http.StatusCreated {
-			log.Error().Str("pod", pod.Name).Int("status", postResp.StatusCode).Msg("Failed to create job")
+			// 실패 시 큐에 다시 넣는 로직 고려 필요 (여기선 생략)
 			continue
 		}
 		defer postResp.Body.Close()
 
-		body, err := io.ReadAll(postResp.Body)
-		if err != nil {
-			log.Error().Err(err).Str("pod", pod.Name).Msg("Failed to parse body")
-			continue
+		if postResp.StatusCode == http.StatusCreated {
+			// 작업을 할당했으니, 이 파드도 이제 "Busy" 입니다.
+			busyWorkers++
+			body, _ := io.ReadAll(postResp.Body)
+			log.Info().Str("pod", pod.Name).Any("job", job).RawJSON("body", body).Msg("Job assigned")
+		} else {
+			log.Error().Str("pod", pod.Name).Int("status", postResp.StatusCode).Msg("Failed to create job")
 		}
-
-		log.Info().Str("pod", pod.Name).Any("job", job).RawJSON("body", body).Msg("Job assigned")
 	}
+
+	// ====================================================================
+	// Scaling Logic (Differential Scale)
+	// ====================================================================
 
 	err = retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		if err := r.Get(ctx, req.NamespacedName, deployment); err != nil {
 			return err
 		}
 
-		if *deployment.Spec.Replicas == operatable.Spec.MaxSize {
+		// 🔥 [핵심 수정] 목표 레플리카 수 계산 공식 변경
+		// Target = (현재 작업 중인 파드) + (준비 중인 파드) + (대기 중인 작업)
+		// 이렇게 하면 Reconcile이 100번 돌아도 중복으로 더해지지 않습니다.
+		totalNeeded := busyWorkers + len(r.Reservations) + r.Queue.Len()
+
+		// Min/Max 적용
+		desiredReplicas := min(max(int32(totalNeeded), operatable.Spec.MinSize), operatable.Spec.MaxSize)
+
+		// 변경 사항이 없으면 리턴
+		if *deployment.Spec.Replicas == desiredReplicas {
 			return nil
 		}
 
-		*deployment.Spec.Replicas = min(*deployment.Spec.Replicas+int32(r.Queue.Len()), operatable.Spec.MaxSize)
-		if *deployment.Spec.Replicas == deployment.Status.Replicas {
-			return nil
-		}
+		log.Info().
+			Int("Busy", busyWorkers).
+			Int("Reserved", len(r.Reservations)).
+			Int("Queue", r.Queue.Len()).
+			Int32("Current", *deployment.Spec.Replicas).
+			Int32("Target", desiredReplicas).
+			Msg("Scaling Deployment")
 
-		err = r.Client.Update(ctx, deployment)
-		if err != nil {
-			return err
-		}
-		log.Info().Int32("replicas", *deployment.Spec.Replicas).Msg("Scaled up Deployment")
-
-		return nil
+		deployment.Spec.Replicas = &desiredReplicas
+		return r.Client.Update(ctx, deployment)
 	})
+
 	if err != nil {
-		log.Error().Err(err).Msg("Failed to scale up Deployment.")
+		log.Error().Err(err).Msg("Failed to update Deployment.")
 		return ctrl.Result{}, err
 	}
 
@@ -319,9 +281,10 @@ func (r *OperatableReconciler) SetupWithManager(mgr ctrl.Manager) error {
 			return true
 		},
 	}
+	_ = logEvents
 
 	return ctrl.NewControllerManagedBy(mgr).
-		For(&operatablev1.Operatable{}, builder.WithPredicates(logEvents)).
+		For(&operatablev1.Operatable{}).
 		Owns(&appsv1.Deployment{}).
 		Owns(&corev1.Pod{}, builder.WithPredicates(podReadyPredicate())).
 		WatchesRawSource(
@@ -416,11 +379,9 @@ func (r *OperatableReconciler) getPodList(ctx context.Context, req *ctrl.Request
 	return podList, nil
 }
 
-// func (r *OperatableReconciler) reloadPod(ctx context.Context, pod *corev1.Pod) error {
-// 	return r.Client.Get(ctx, types.NamespacedName{Name: pod.Name, Namespace: pod.Namespace}, pod)
-// }
-
 func (r *OperatableReconciler) NotifyEvent(namespace, name string) {
+	log.Info().Str("cr", name).Msg("🟣 Triggering Reconcile via Channel")
+
 	select {
 	case r.EventChannel <- event.GenericEvent{
 		Object: &operatablev1.Operatable{
@@ -433,23 +394,3 @@ func (r *OperatableReconciler) NotifyEvent(namespace, name string) {
 	default:
 	}
 }
-
-// func (r *OperatableReconciler) HandleJobDone(ctx context.Context, podName string, jobID string) error {
-// 	log.Info().Str("jobID", jobID).Msg("Handling job done callback")
-
-// 	operatable := &operatablev1.Operatable{}
-// 	err := r.Get(ctx, types.NamespacedName{Namespace: "app", Name: "operatable"}, operatable)
-// 	if err != nil {
-// 		log.Error().Err(err).Msg("Failed to get Operatable CR")
-// 		return err
-// 	}
-
-// 	delete(operatable.Status.Runnings[podName], jobID)
-// 	err = r.Status().Update(ctx, operatable)
-// 	if err != nil {
-// 		log.Error().Err(err).Msg("Failed to update Operatable status")
-// 		return err
-// 	}
-
-// 	return nil
-// }

@@ -248,14 +248,6 @@ func main() {
 			jobID := ctx.Param("id")
 			log.Info().Str("pod", podName).Str("jobID", jobID).Msg("Received job done callback")
 
-			// go func() {
-			// 	err := operatableController.HandleJobDone(ctx.Request.Context(), podName, jobID)
-			// 	if err != nil {
-			// 		log.Error().Err(err).Str("pod", podName).Str("jobID", jobID).
-			// 			Msg("failed to handle job done callback")
-			// 	}
-			// }()
-
 			operatableController.NotifyEvent("app", "operatable")
 			ctx.JSON(http.StatusOK, gin.H{"message": "job done callback received"})
 		})

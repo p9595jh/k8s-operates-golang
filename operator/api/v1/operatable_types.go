@@ -59,7 +59,6 @@ type OperatableStatus struct {
 	// +listMapKey=type
 	// +optional
 	Conditions []metav1.Condition `json:"conditions,omitempty"`
-	Replicas   int32              `json:"replicas,omitempty"`
 }
 
 // +kubebuilder:object:root=true
